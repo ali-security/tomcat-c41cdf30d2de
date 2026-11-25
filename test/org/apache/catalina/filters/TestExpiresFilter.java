@@ -17,7 +17,9 @@
 package org.apache.catalina.filters;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Calendar;
 import java.util.HashMap;
 import java.util.List;
@@ -26,7 +28,12 @@ import java.util.Map.Entry;
 import java.util.StringTokenizer;
 import java.util.TimeZone;
 
+import jakarta.servlet.Filter;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.GenericFilter;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -35,10 +42,12 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.catalina.Context;
+import org.apache.catalina.authenticator.BasicAuthenticator;
 import org.apache.catalina.filters.ExpiresFilter.Duration;
 import org.apache.catalina.filters.ExpiresFilter.DurationUnit;
 import org.apache.catalina.filters.ExpiresFilter.ExpiresConfiguration;
 import org.apache.catalina.filters.ExpiresFilter.StartingPoint;
+import org.apache.catalina.startup.TesterMapRealm;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
 import org.apache.tomcat.util.buf.ByteChunk;
@@ -46,6 +55,9 @@ import org.apache.tomcat.util.buf.StringUtils;
 import org.apache.tomcat.util.collections.CaseInsensitiveKeyMap;
 import org.apache.tomcat.util.descriptor.web.FilterDef;
 import org.apache.tomcat.util.descriptor.web.FilterMap;
+import org.apache.tomcat.util.descriptor.web.LoginConfig;
+import org.apache.tomcat.util.descriptor.web.SecurityCollection;
+import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
 import org.apache.tomcat.util.http.FastHttpDateFormat;
 
 public class TestExpiresFilter extends TomcatBaseTest {
@@ -368,11 +380,31 @@ public class TestExpiresFilter extends TomcatBaseTest {
 
     protected void validate(HttpServlet servlet, Integer expectedMaxAgeInSeconds, Boolean expectedExpires,
             int expectedResponseStatusCode) throws Exception {
+        validate(servlet, null, expectedMaxAgeInSeconds, expectedExpires, expectedResponseStatusCode);
+    }
+
+    protected Map<String,List<String>> validate(HttpServlet servlet, Filter previousFilter,
+            Integer expectedMaxAgeInSeconds, Boolean expectedExpires, int expectedResponseStatusCode)
+            throws Exception {
 
         // SETUP
 
         Tomcat tomcat = getTomcatInstance();
         Context root = tomcat.addContext("", TEMP_DIR);
+
+        if (previousFilter != null) {
+            // Filter that is invoked before the ExpiresFilter in the filter chain
+            FilterDef previousFilterDef = new FilterDef();
+            previousFilterDef.setFilter(previousFilter);
+            previousFilterDef.setFilterClass(previousFilter.getClass().getName());
+            previousFilterDef.setFilterName(previousFilter.getClass().getName());
+            root.addFilterDef(previousFilterDef);
+
+            FilterMap previousFilterMap = new FilterMap();
+            previousFilterMap.setFilterName(previousFilter.getClass().getName());
+            previousFilterMap.addURLPattern("*");
+            root.addFilterMap(previousFilterMap);
+        }
 
         FilterDef filterDef = new FilterDef();
         filterDef.addInitParameter("ExpiresDefault", "access plus 1 minute");
@@ -444,7 +476,7 @@ public class TestExpiresFilter extends TomcatBaseTest {
                                 "] should be null or 'no-store' should be set",
                         actualMaxAgeInSeconds == null ||
                                 (cacheControlHeader != null && cacheControlHeader.contains("no-store")));
-                return;
+                return responseHeaders;
             }
 
             Assert.assertNotNull(actualMaxAgeInSeconds);
@@ -470,6 +502,7 @@ public class TestExpiresFilter extends TomcatBaseTest {
                     expectedMaxAgeInSeconds + ", request time: " + timeBeforeInMillis + " for content type " +
                     contentType, deltaInSeconds < 3);
 
+            return responseHeaders;
         } finally {
             tomcat.stop();
         }
@@ -621,5 +654,189 @@ public class TestExpiresFilter extends TomcatBaseTest {
         // final effective Cache-Control: public, max-age=600
         // apply ExpiresFilter
         validate(servlet, Integer.valueOf(60), Boolean.TRUE, HttpServletResponse.SC_OK);
+    }
+
+
+    /*
+     * Cache-Control set before the ExpiresFilter wraps the response (e.g. by a previous filter) must be retained and
+     * the max-age directive appended to it rather than replacing it.
+     */
+    @Test
+    public void testCacheControlPrivateSetByPreviousFilter() throws Exception {
+        HttpServlet servlet = new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void service(HttpServletRequest request, HttpServletResponse response)
+                    throws ServletException, IOException {
+                response.setContentType("image/jpeg");
+                response.getWriter().print("Hello world");
+            }
+        };
+
+        Map<String,List<String>> responseHeaders = validate(servlet, new CacheControlFilter("private"),
+                Integer.valueOf(60), Boolean.TRUE, HttpServletResponse.SC_OK);
+
+        String cacheControlHeader = StringUtils.join(responseHeaders.get("Cache-Control"));
+        Assert.assertTrue(cacheControlHeader, cacheControlHeader.contains("private"));
+        Assert.assertTrue(cacheControlHeader, cacheControlHeader.contains("max-age="));
+    }
+
+
+    @Test
+    public void testCacheControlNoStoreSetByPreviousFilter() throws Exception {
+        HttpServlet servlet = new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void service(HttpServletRequest request, HttpServletResponse response)
+                    throws ServletException, IOException {
+                response.setContentType("image/jpeg");
+                response.getWriter().print("Hello world");
+            }
+        };
+
+        Map<String,List<String>> responseHeaders = validate(servlet, new CacheControlFilter("no-store"), null,
+                Boolean.FALSE, HttpServletResponse.SC_OK);
+
+        // no-store set by the previous filter means the ExpiresFilter must not add any expiration headers
+        String cacheControlHeader = StringUtils.join(responseHeaders.get("Cache-Control"));
+        Assert.assertEquals("no-store", cacheControlHeader);
+        Assert.assertNull(responseHeaders.get("Expires"));
+    }
+
+
+    @Test
+    public void testCacheControlMaxAgeSetByPreviousFilter() throws Exception {
+        HttpServlet servlet = new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void service(HttpServletRequest request, HttpServletResponse response)
+                    throws ServletException, IOException {
+                response.setContentType("image/jpeg");
+                response.getWriter().print("Hello world");
+            }
+        };
+
+        // max-age set by the previous filter means the ExpiresFilter must not add any expiration headers
+        validate(servlet, new CacheControlFilter("max-age=600"), Integer.valueOf(600), Boolean.FALSE,
+                HttpServletResponse.SC_OK);
+    }
+
+
+    @Test
+    public void testCacheControlSetByPreviousFilterAndAddedByServlet() throws Exception {
+        HttpServlet servlet = new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void service(HttpServletRequest request, HttpServletResponse response)
+                    throws ServletException, IOException {
+                response.setContentType("image/jpeg");
+                response.addHeader("Cache-Control", "public");
+                response.getWriter().print("Hello world");
+            }
+        };
+
+        Map<String,List<String>> responseHeaders = validate(servlet, new CacheControlFilter("no-store"), null,
+                Boolean.FALSE, HttpServletResponse.SC_OK);
+
+        // The no-store set by the previous filter must neither be lost nor ignored
+        String cacheControlHeader = StringUtils.join(responseHeaders.get("Cache-Control"));
+        Assert.assertTrue(cacheControlHeader, cacheControlHeader.contains("no-store"));
+        Assert.assertTrue(cacheControlHeader, cacheControlHeader.contains("public"));
+        Assert.assertFalse(cacheControlHeader, cacheControlHeader.contains("max-age"));
+        Assert.assertNull(responseHeaders.get("Expires"));
+    }
+
+
+    /*
+     * The authenticator sets "Cache-Control: private" for responses to requests for protected resources. That header
+     * must not be removed by the ExpiresFilter else the response may be stored by a shared cache.
+     */
+    @Test
+    public void testCacheControlSetByAuthenticator() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Context root = tomcat.addContext("", TEMP_DIR);
+
+        HttpServlet servlet = new HttpServlet() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void service(HttpServletRequest request, HttpServletResponse response)
+                    throws ServletException, IOException {
+                response.setContentType("image/jpeg");
+                response.getWriter().print("Hello world");
+            }
+        };
+        Tomcat.addServlet(root, servlet.getClass().getName(), servlet);
+        root.addServletMapping("/protected", servlet.getClass().getName());
+
+        SecurityCollection collection = new SecurityCollection();
+        collection.addPattern("/protected");
+        SecurityConstraint constraint = new SecurityConstraint();
+        constraint.addAuthRole("role");
+        constraint.addCollection(collection);
+        root.addConstraint(constraint);
+
+        TesterMapRealm realm = new TesterMapRealm();
+        realm.addUser("user", "pwd");
+        realm.addUserRole("user", "role");
+        root.setRealm(realm);
+
+        LoginConfig loginConfig = new LoginConfig();
+        loginConfig.setAuthMethod(HttpServletRequest.BASIC_AUTH);
+        root.setLoginConfig(loginConfig);
+        root.getPipeline().addValve(new BasicAuthenticator());
+
+        FilterDef filterDef = new FilterDef();
+        filterDef.addInitParameter("ExpiresDefault", "access plus 1 minute");
+        filterDef.setFilterClass(ExpiresFilter.class.getName());
+        filterDef.setFilterName(ExpiresFilter.class.getName());
+        root.addFilterDef(filterDef);
+
+        FilterMap filterMap = new FilterMap();
+        filterMap.setFilterName(ExpiresFilter.class.getName());
+        filterMap.addURLPattern("*");
+        root.addFilterMap(filterMap);
+
+        tomcat.start();
+
+        Map<String,List<String>> requestHeaders = new HashMap<>();
+        List<String> authorization = new ArrayList<>();
+        authorization.add(
+                "Basic " + Base64.getEncoder().encodeToString("user:pwd".getBytes(StandardCharsets.ISO_8859_1)));
+        requestHeaders.put("Authorization", authorization);
+        Map<String,List<String>> responseHeaders = new CaseInsensitiveKeyMap<>();
+
+        ByteChunk bc = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/protected", bc, requestHeaders, responseHeaders);
+
+        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
+        Assert.assertEquals("Hello world", bc.toString());
+
+        String cacheControlHeader = StringUtils.join(responseHeaders.get("Cache-Control"));
+        Assert.assertTrue(cacheControlHeader, cacheControlHeader.contains("private"));
+        Assert.assertTrue(cacheControlHeader, cacheControlHeader.contains("max-age="));
+    }
+
+
+    public static final class CacheControlFilter extends GenericFilter {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String cacheControl;
+
+        public CacheControlFilter(String cacheControl) {
+            this.cacheControl = cacheControl;
+        }
+
+        @Override
+        public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+                throws IOException, ServletException {
+            ((HttpServletResponse) response).setHeader("Cache-Control", cacheControl);
+            chain.doFilter(request, response);
+        }
     }
 }
